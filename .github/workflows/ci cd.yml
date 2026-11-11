@@ -1,0 +1,81 @@
+name: probe ci
+
+on:
+  # 只在推送到 main 分支时触发（注意：不是手动触发，见下方 inputs 说明）
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # 允许写入 GitHub 包仓库（GHCR），这样才有权推送镜像
+      packages: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: 运行测试
+        run: pytest
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          # 目标镜像仓库
+          registry: ghcr.io
+          # 登录用户名（对应 ghcr.io/<用户名> 这个命名空间）
+          username: rcodetree
+          # GITHUB_TOKEN 是 GitHub 每次运行 Workflow 时自动注入的临时令牌，
+          # 权限由上方 permissions.packages: write 决定，无需手动配置
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建镜像
+        run: docker build -t ghcr.io/rcodetree:${{ github.sha }} .
+
+      - name: 推送镜像
+        run: docker push ghcr.io/rcodetree:${{ github.sha }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 确定要部署的镜像 tag
+        run: |
+          # 尝试从手动触发参数里取 tag。
+          # 注意：github.event.inputs 只在 workflow_dispatch（手动触发）才有值，
+          # 而当前 Workflow 只监听 push，所以这里恒为空，会一直走下面的 fallback。
+          TAG="${{github.event.inputs.tag}}"
+          if [ -z "$TAG" ]; then
+            # 没有手动指定时，默认用本次提交的 SHA 作为 tag
+            TAG="${{github.sha}}"
+          fi
+          # 写入 $GITHUB_ENV：向该文件追加 KEY=VALUE 后，
+          # 本 Job 后续 step 就能通过 ${{ env.DEPLOY_TAG }} 读取
+          echo "DEPLOY_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: SSH 部署到服务器
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          # 以下三项是 SSH 登录生产服务器的凭据，全部从仓库 Secrets 读取
+          # 生产私钥严禁提交进代码库
+          host: ${{secrets.SSH_HOST}}
+          username: ${{secrets.SSH_USER}}
+          key: ${{secrets.SSH_KEY}}
+          script: |
+            # 在服务器上拉取指定 tag 的镜像（${{ }} 在 runner 上求值后才会被 SSH 执行）
+            docker pull ghcr.io/${{github.repository}}:${{ env.DEPLOY_TAG }}
+            # 停止并删除旧容器（|| true 保证容器不存在时也不报错中断）
+            docker stop probe || true
+            docker rm probe || true
+            # 以重启自愈策略后台运行新容器
+            docker run -d --name probe --restart unless-stopped ghcr.io/${{github.repository}}:${{ env.DEPLOY_TAG }}

@@ -1,9 +1,20 @@
 name: probe ci
 
 on:
-  # 只在推送到 main 分支时触发（注意：不是手动触发，见下方 inputs 说明）
   push:
     branches: [ "main" ]
+  # 手动触发：可在界面上指定要部署的历史镜像 tag（用于回滚到旧版本）
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要部署的镜像 tag（留空则默认使用本次提交 SHA）"
+        required: false
+
+# 全局镜像名。注意：Docker/GHCR 镜像路径强制要求全小写，
+# 你的 GitHub 用户名是 RCodeTree，这里必须写成小写 rcodetree，
+# 否则 docker pull/push 会报 "repository name must be lowercase"。
+env:
+  IMAGE_NAME: ghcr.io/rcodetree/test
 
 jobs:
   build:
@@ -31,19 +42,19 @@ jobs:
       - name: 登录 GHCR
         uses: docker/login-action@v3
         with:
-          # 目标镜像仓库
           registry: ghcr.io
-          # 登录用户名（对应 ghcr.io/<用户名> 这个命名空间）
-          username: rcodetree
+          # 登录用户名：github.repository_owner 会自动取当前仓库所有者（即 RCodeTree）
+          username: ${{ github.repository_owner }}
           # GITHUB_TOKEN 是 GitHub 每次运行 Workflow 时自动注入的临时令牌，
           # 权限由上方 permissions.packages: write 决定，无需手动配置
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 构建镜像
-        run: docker build -t ghcr.io/rcodetree:${{ github.sha }} .
+        # 每次提交都以 commit SHA 作为唯一 tag，构建小写镜像名
+        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
 
       - name: 推送镜像
-        run: docker push ghcr.io/rcodetree:${{ github.sha }}
+        run: docker push ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
   deploy:
     needs: build
@@ -51,13 +62,11 @@ jobs:
     steps:
       - name: 确定要部署的镜像 tag
         run: |
-          # 尝试从手动触发参数里取 tag。
-          # 注意：github.event.inputs 只在 workflow_dispatch（手动触发）才有值，
-          # 而当前 Workflow 只监听 push，所以这里恒为空，会一直走下面的 fallback。
-          TAG="${{github.event.inputs.tag}}"
+          # 手动触发（workflow_dispatch）时优先用输入框里指定的 tag，用于回滚；
+          # 普通 push 时 github.event.inputs 为空，回退到本次提交 SHA。
+          TAG="${{ github.event.inputs.tag }}"
           if [ -z "$TAG" ]; then
-            # 没有手动指定时，默认用本次提交的 SHA 作为 tag
-            TAG="${{github.sha}}"
+            TAG="${{ github.sha }}"
           fi
           # 写入 $GITHUB_ENV：$GITHUB_ENV 是 GitHub 指定的特殊文件路径，
           # 往里面追加 KEY=VALUE（如 DEPLOY_TAG=abc），GitHub 就会把它登记成
@@ -71,17 +80,17 @@ jobs:
         with:
           # 以下三项是 SSH 登录生产服务器的凭据，全部从仓库 Secrets 读取
           # 生产私钥严禁提交进代码库
-          host: ${{secrets.SSH_HOST}}
-          username: ${{secrets.SSH_USER}}
-          key: ${{secrets.SSH_KEY}}
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
           script: |
             # 在服务器上拉取指定 tag 的镜像。这里的 env 是 GitHub Actions 的上下文，
-            # ${{ env.DEPLOY_TAG }} 读取上一步写入 $GITHUB_ENV 的 DEPLOY_TAG 变量值；
-            # 这些 ${{ }} 会先在 runner 上被替换成实际值（如 abc123），
-            # 再把替换后的完整命令通过 SSH 发到服务器执行，服务器上不存在该变量。
-            docker pull ghcr.io/${{github.repository}}:${{ env.DEPLOY_TAG }}
+            # ${{ env.IMAGE_NAME }} / ${{ env.DEPLOY_TAG }} 会先在 runner 上被替换成
+            # 实际值（如 ghcr.io/rcodetree/test、abc123），再把替换后的完整命令
+            # 通过 SSH 发到服务器执行，服务器上并不存在这些变量。
+            docker pull ${{ env.IMAGE_NAME }}:${{ env.DEPLOY_TAG }}
             # 停止并删除旧容器（|| true 保证容器不存在时也不报错中断）
             docker stop probe || true
             docker rm probe || true
             # 以重启自愈策略后台运行新容器
-            docker run -d --name probe --restart unless-stopped ghcr.io/${{github.repository}}:${{ env.DEPLOY_TAG }}
+            docker run -d --name probe --restart unless-stopped ${{ env.IMAGE_NAME }}:${{ env.DEPLOY_TAG }}

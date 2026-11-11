@@ -59,8 +59,11 @@ jobs:
             # 没有手动指定时，默认用本次提交的 SHA 作为 tag
             TAG="${{github.sha}}"
           fi
-          # 写入 $GITHUB_ENV：向该文件追加 KEY=VALUE 后，
-          # 本 Job 后续 step 就能通过 ${{ env.DEPLOY_TAG }} 读取
+          # 写入 $GITHUB_ENV：$GITHUB_ENV 是 GitHub 指定的特殊文件路径，
+          # 往里面追加 KEY=VALUE（如 DEPLOY_TAG=abc），GitHub 就会把它登记成
+          # 本 Job 的环境变量，之后所有 step 都能通过 ${{ env.KEY }} 读取。
+          # 普通 shell 变量 $TAG 只活在当前 run 进程里，step 结束即失效，
+          # 必须写到 $GITHUB_ENV 才能跨 step 传递。
           echo "DEPLOY_TAG=$TAG" >> "$GITHUB_ENV"
 
       - name: SSH 部署到服务器
@@ -72,7 +75,10 @@ jobs:
           username: ${{secrets.SSH_USER}}
           key: ${{secrets.SSH_KEY}}
           script: |
-            # 在服务器上拉取指定 tag 的镜像（${{ }} 在 runner 上求值后才会被 SSH 执行）
+            # 在服务器上拉取指定 tag 的镜像。这里的 env 是 GitHub Actions 的上下文，
+            # ${{ env.DEPLOY_TAG }} 读取上一步写入 $GITHUB_ENV 的 DEPLOY_TAG 变量值；
+            # 这些 ${{ }} 会先在 runner 上被替换成实际值（如 abc123），
+            # 再把替换后的完整命令通过 SSH 发到服务器执行，服务器上不存在该变量。
             docker pull ghcr.io/${{github.repository}}:${{ env.DEPLOY_TAG }}
             # 停止并删除旧容器（|| true 保证容器不存在时也不报错中断）
             docker stop probe || true
